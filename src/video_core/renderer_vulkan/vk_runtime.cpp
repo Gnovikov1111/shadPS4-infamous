@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -738,6 +739,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
+        ++new_backing->state_version;
     }
 
     image->InvalidateSubrects();
@@ -747,6 +749,13 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
     MakeCurrent(handle);
+    if (resource->batched) {
+        bool has_access = resource->batched_write.Overlaps(offset, offset + size);
+        if (check_read_access && !has_access) {
+            has_access |= resource->batched_read.Overlaps(offset, offset + size);
+        }
+        return has_access;
+    }
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
         has_access |= resource->read_ranges.Overlaps(offset, offset + size);
@@ -775,11 +784,21 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
-    }
-    if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+    if (resource->batched) {
+        VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().access_adds);
+        if (src_access & WRITE_MASK) {
+            resource->batched_write.Add(range.start, range.end);
+        }
+        if (src_access & READ_MASK) {
+            resource->batched_read.Add(range.start, range.end);
+        }
+    } else {
+        if (src_access & WRITE_MASK) {
+            resource->write_ranges.Add(range);
+        }
+        if (src_access & READ_MASK) {
+            resource->read_ranges.Add(range);
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -813,6 +832,8 @@ void Runtime::FlushBarriers() {
     for (auto& resource : resources) {
         resource.read_ranges.Clear();
         resource.write_ranges.Clear();
+        resource.batched_read.Clear();
+        resource.batched_write.Clear();
     }
     resources.clear();
     resource = nullptr;
@@ -828,6 +849,12 @@ void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
         return;
     }
     resource = &resources.emplace_back(handle);
+    // The representation is fixed for the entry's lifetime (until the next barrier flush), so
+    // the A/B mode can switch between flushes without mixing the two lists.
+    resource->batched = VideoCore::ReadbackTrace::FastAccessLists();
+    const bool lazy = VideoCore::ReadbackTrace::LazyReadRanges();
+    resource->batched_read.SetLazy(lazy);
+    resource->batched_write.SetLazy(lazy);
 }
 
 } // namespace Vulkan

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <mutex>
 #include <optional>
 
@@ -154,6 +155,14 @@ public:
         vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     };
+    /// A partial read-only transition known to need no barriers while `version` matches
+    /// BackingImage::state_version (local optimization, SHADPS4_BARRIER_MEMO).
+    struct NoopTransition {
+        SubresourceRange range{};
+        vk::ImageLayout layout{};
+        vk::AccessFlags2 access_mask{};
+        u32 version{};
+    };
     struct BackingImage {
         UniqueImage image;
         State state;
@@ -162,6 +171,10 @@ public:
         SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;
         bool subrect_valid{};
+        /// Bumped whenever `state` or `subresource_states` change; invalidates noop_memo.
+        u32 state_version{1};
+        u32 noop_memo_next{};
+        std::array<NoopTransition, 4> noop_memo{};
     };
     BackingImage& AddBacking(const vk::ImageCreateInfo& create_info, u32 num_samples);
     ImageView& FindView(const ImageViewInfo& view_info, BackingImage& view_backing);

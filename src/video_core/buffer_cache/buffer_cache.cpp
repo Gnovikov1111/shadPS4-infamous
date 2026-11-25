@@ -11,8 +11,10 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/copy_worker.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -127,6 +129,8 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write) {
+    // Guest memory now holds data the GPU wrote; stream copies made earlier are stale.
+    ReadbackTrace::BumpGuestMemoryEpoch(ReadbackTrace::EpochSource::Unmark);
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, is_write);
     gpu_modified_ranges.Subtract(device_addr, size);
 }
@@ -182,6 +186,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    ReadbackTrace::RecordDownload(total_size_bytes);
     const auto download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, async);
     for (auto& copy : copies) {
@@ -198,6 +203,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                                     copy.size);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        ReadbackTrace::BumpGuestMemoryEpoch(ReadbackTrace::EpochSource::WriteBack);
 
         if (async) {
             staging_pool.FreeDeferred(download);
@@ -220,9 +226,42 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
+        // Local optimization (SHADPS4_STREAM_DEDUPE): the same vertex/index/constant buffer is
+        // often bound by many draws in a row (depth, shadow and main passes). If guest memory
+        // cannot have changed since its last copy and that copy is still in the stream buffer,
+        // bind it again: the GPU reads exactly the bytes a fresh copy would contain.
+        StreamCopy* cached = nullptr;
+        u64 epoch = 0;
+        if (ReadbackTrace::StreamDedupe()) {
+            epoch = ReadbackTrace::GuestMemoryEpoch().load(std::memory_order_acquire);
+            const u64 hash = (device_addr ^ (u64{size} << 44)) * 0x9E3779B97F4A7C15ULL;
+            cached = &stream_copies[hash >> (64 - StreamCopyTableBits)];
+            if (cached->device_addr == device_addr && cached->size == size &&
+                cached->epoch == epoch && cached->generation == stream_buffer.Generation()) {
+                ReadbackTrace::Count(ReadbackTrace::Counters().stream_reuses);
+                ReadbackTrace::Count(ReadbackTrace::Counters().stream_reuse_bytes, size);
+                return {&stream_buffer, cached->offset};
+            }
+            if (cached->device_addr == device_addr && cached->size == size &&
+                cached->generation == stream_buffer.Generation()) {
+                ReadbackTrace::Count(ReadbackTrace::Pipe().stream_epoch_misses);
+                ReadbackTrace::Count(ReadbackTrace::Pipe().stream_epoch_miss_bytes, size);
+            }
+        }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
-        memory->CopySparseMemory(device_addr, data, size);
+        if (auto& worker = CopyWorker::Instance(); worker.Active() && stream_buffer.is_coherent) {
+            // Assembly line: the worker fills the reserved bytes before the next submit.
+            worker.Push(device_addr, data, size);
+        } else {
+            memory->CopySparseMemory(device_addr, data, size);
+        }
         stream_buffer.Commit();
+        ReadbackTrace::Count(ReadbackTrace::Counters().stream_copies);
+        ReadbackTrace::Count(ReadbackTrace::Counters().stream_copy_bytes, size);
+        if (cached) {
+            // Generation is read after Map, which may have wrapped the buffer.
+            *cached = StreamCopy{device_addr, size, offset, epoch, stream_buffer.Generation()};
+        }
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;
@@ -245,7 +284,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
-    memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    // Texture uploads: only the GPU reads this staging copy (detile dispatch / image copy), so the
+    // copy worker may fill it before the next submit, like the other staging uploads.
+    if (auto& worker = CopyWorker::Instance(); worker.Active() && staging.buffer->is_coherent) {
+        worker.Push(device_addr, staging.mapped, staging.size);
+    } else {
+        memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    }
     staging.Flush();
     return {staging.buffer, staging.offset};
 }
@@ -262,6 +307,10 @@ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
     texture_cache.MarkAsMaybeGpuDirty(addr, size);
     memory_tracker->MarkRegionAsGpuModified(addr, size);
     gpu_modified_ranges.Add(addr, size);
+}
+
+void BufferCache::MarkRegionAsCpuModifiedIfNotGpu(VAddr addr, size_t size) {
+    memory_tracker->MarkRegionAsCpuModifiedIfNotGpu(addr, size);
 }
 
 void BufferCache::ReadEdgeImagePages(const Image& image) {
@@ -457,8 +506,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     });
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        auto& worker = CopyWorker::Instance();
+        const bool queue_copies = worker.Active() && staging.buffer->is_coherent;
         for (auto& copy : copies) {
-            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+            if (queue_copies) {
+                worker.Push(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+            } else {
+                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
+                                         copy.size);
+            }
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
         }

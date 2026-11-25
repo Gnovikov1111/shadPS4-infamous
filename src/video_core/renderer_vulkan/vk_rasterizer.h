@@ -74,6 +74,7 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void WidenCpuWriteFault(VAddr fault_addr, u64 pages);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
@@ -161,6 +162,26 @@ private:
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
+
+    /// Local optimization (SHADPS4_IMAGE_DESC_CACHE): ImageDesc(T#, resource) depends only on the
+    /// 32-byte T# and the resource's is_depth/is_written/is_array flags, so rebuilding it (sizes,
+    /// mip layout, view) for the same texture on every draw can be skipped.
+    struct ImageDescCacheEntry {
+        std::array<u64, 4> sharp{};
+        u32 flags{};
+        bool valid{};
+        u32 version{}; // bumped whenever desc is replaced
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    static constexpr size_t ImageDescCacheSize = 512;
+    std::array<ImageDescCacheEntry, ImageDescCacheSize> image_desc_cache{};
+    /// Local optimization (SHADPS4_DESC_SLOT_REUSE): which cache entry (and its version) each
+    /// image_bindings slot was last copied from, unmodified. If the next draw binds the same
+    /// texture in the same slot, the ~400-byte copy is skipped. nullptr = slot was modified.
+    std::array<const ImageDescCacheEntry*, Shader::NUM_IMAGES> slot_desc_src{};
+    std::array<u32, Shader::NUM_IMAGES> slot_desc_version{};
+    void MakeImageDesc(u32 slot, VideoCore::TextureCache::ImageDesc& desc,
+                       const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc);
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;

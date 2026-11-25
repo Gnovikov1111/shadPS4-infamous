@@ -81,7 +81,10 @@ public:
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    /// Loads one cached shader stage. `effective_perm_hash` receives the permutation hash the
+    /// runtime will compute for this specialization, which can differ from the stored one when
+    /// the cache holds entries recorded in a different permutation order.
+    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage, u64& effective_perm_hash);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -139,6 +142,8 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    u32 num_preload_remaps{};     // cached stages whose permutation index was remapped on load
+    u32 num_preload_duplicates{}; // cached pipelines that resolved to an already loaded key
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

@@ -425,6 +425,30 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+
+    /// Local optimization (SHADPS4_FIND_IMAGE_CACHE): exact-match FindImage results. Only
+    /// RegisterImage/UnregisterImage change which images a lookup can see (the fields compared
+    /// below are never modified on a registered image), so an entry stays valid while
+    /// registry_epoch is unchanged.
+    struct FindImageKey {
+        VAddr guest_address{};
+        u32 guest_size{};
+        Extent3D size{};
+        vk::Format pixel_format{};
+        AmdGpu::ImageType type{};
+        SubresourceExtent resources{};
+        bool exact_fmt{};
+        bool operator==(const FindImageKey&) const = default;
+    };
+    struct FindImageEntry {
+        FindImageKey key{};
+        ImageId image_id{};
+        u64 epoch{};
+    };
+    static constexpr size_t FindImageCacheSize = 1024;
+    std::array<FindImageEntry, FindImageCacheSize> find_image_cache{};
+    u64 registry_epoch = 1;
+
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;

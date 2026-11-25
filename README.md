@@ -3,6 +3,47 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
+<div align="center">
+
+# shadPS4 &middot; inFAMOUS Second Son edition
+
+**An unofficial shadPS4 branch for _inFAMOUS Second Son_:<br>
+profiler-driven speed-ups and a 21:9 ultrawide patch.**
+
+<a href="infamous-second-son/README.md"><img src="https://img.shields.io/badge/game-CUSA00004%20v01.07-b31b1b?style=for-the-badge" alt="Game: CUSA00004 v01.07"></a>
+<a href="infamous-second-son/README.md#ultrawide-219-patch"><img src="https://img.shields.io/badge/ultrawide-21%3A9-1f6feb?style=for-the-badge" alt="Ultrawide 21:9"></a>
+<a href="infamous-second-son/README.md#results"><img src="https://img.shields.io/badge/bridge%20view-6.5%20%E2%86%92%2021%20FPS-2ea043?style=for-the-badge" alt="Bridge view: 6.5 to 21 FPS"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0-8b949e?style=for-the-badge" alt="License: GPL-2.0"></a>
+
+[**Guide**](infamous-second-son/README.md) &nbsp;&middot;&nbsp;
+[**Ultrawide patch**](infamous-second-son/README.md#ultrawide-219-patch) &nbsp;&middot;&nbsp;
+[**Results**](infamous-second-son/README.md#results) &nbsp;&middot;&nbsp;
+[**Launcher**](infamous-second-son/Play-inFAMOUS.cmd) &nbsp;&middot;&nbsp;
+[**Credits**](infamous-second-son/README.md#credits)
+
+</div>
+
+> [!TIP]
+> **Just want to play?** Use **[shadPS4-AYOUB1080p](https://github.com/weshayoub92/shadPS4-AYOUB1080p)
+> by AYOUB1080p**. His fork takes the same idea further by spreading the GPU work over several
+> threads, and it reached about **50 FPS in combat** on our test PC. Our ultrawide patch works
+> with it, and the guide has [a fix for its shader freezes](infamous-second-son/README.md#tips-for-the-ayoub1080p-build).
+
+### What's in this branch
+
+| | |
+| --- | --- |
+| **[21:9 ultrawide patch](infamous-second-son/README.md#ultrawide-219-patch)** | 3440x1440 or 2560x1080 for game version 01.07, with optional "no motion blur" and "no depth of field" entries |
+| **[Performance changes](infamous-second-son/README.md#performance-changes)** | speed-ups for the GPU command thread, found with a profiler; each one is behind an environment switch and off by default |
+| **[Launcher](infamous-second-son/Play-inFAMOUS.cmd)** | turns the switches on for one run: set your game path and start it |
+| **[Research tools](infamous-second-son/tools)** | notes and scripts used to find and check the patch locations |
+
+<sub>Not affiliated with Sony Interactive Entertainment, Sucker Punch Productions or the shadPS4 team.
+No game files, keys or firmware are included. Everything below the line is the original shadPS4
+README.</sub>
+
+---
+
 <h1 align="center">
   <br>
   <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>

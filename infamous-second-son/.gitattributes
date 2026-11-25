@@ -1,0 +1,2 @@
+# Keep the Windows launcher byte-for-byte (CRLF), also in raw downloads.
+*.cmd -text

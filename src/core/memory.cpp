@@ -12,6 +12,8 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#include "video_core/buffer_cache/copy_worker.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
@@ -163,7 +165,12 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+    // GPU-side writes into guest memory (fence labels, readbacks): see GuestMemoryEpoch.
+    VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+        VideoCore::ReadbackTrace::EpochSource::WriteBack);
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    // Queued guest-memory copies that read this range must finish before it changes.
+    VideoCore::CopyWorker::Instance().DrainOverlapping(virtual_addr, size);
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);

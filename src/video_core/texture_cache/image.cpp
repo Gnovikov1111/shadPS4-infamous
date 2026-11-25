@@ -1,9 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "core/debug_state.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -245,6 +253,167 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, BackingImage& view_ba
     return (*slot_image_views)[view_id];
 }
 
+namespace {
+
+/// SHADPS4_TRACE_BARRIERS statistics (local investigation aid).
+struct BarrierStats {
+    struct PerImage {
+        u64 calls{};
+        u64 hits{};
+        u64 visited{};
+        u32 levels{};
+        u32 layers{};
+        SubresourceRange range{};
+        u32 width{};
+        u32 height{};
+        u32 depth{};
+        u32 type{};
+    };
+    // Hot counters are relaxed atomics; the mutex only guards the per-image map (filled on the
+    // rare full partial walks) and the periodic dump, so tracing barely slows the GPU thread.
+    std::mutex mutex;
+    std::atomic<u64> full_calls{};
+    std::atomic<u64> partial_calls{};
+    std::atomic<u64> memo_hits{};
+    std::atomic<u64> visited{};
+    std::atomic<u64> barriers{};
+    std::atomic<u64> ticks{};
+    std::unordered_map<const void*, PerImage> images;
+    std::chrono::steady_clock::time_point last_dump = std::chrono::steady_clock::now();
+    u32 last_flips = DebugState.GetFrameNum();
+    std::string opts_at_start = ActiveOpts();
+
+    static std::string ActiveOpts() {
+        using namespace VideoCore::ReadbackTrace;
+        std::string s;
+        const auto add = [&s](bool on, const char* name) {
+            if (on) {
+                s += s.empty() ? name : std::string{"+"} + name;
+            }
+        };
+        add(BarrierMemo(), "memo");
+        add(FindImageCache(), "find");
+        add(FastAccessLists(), "tree");
+        add(LazyReadRanges(), "lazy");
+        add(ImageDescCache(), "desc");
+        add(StreamDedupe(), "dedupe");
+        add(DescSlotReuse(), "slot");
+        add(PerfSwitchActive(EnvNumber("SHADPS4_COPY_WORKER", 0)), "worker");
+        return s.empty() ? "none" : s;
+    }
+
+    /// Cheap per-call hook: only every 1024th call looks at the clock.
+    void MaybeDump() {
+        const u64 tick = ticks.load(std::memory_order_relaxed);
+        ticks.store(tick + 1, std::memory_order_relaxed);
+        if ((tick & 1023) == 0) {
+            std::scoped_lock lk{mutex};
+            Dump();
+        }
+    }
+
+    /// "Top opcodes" list of one PM4 queue, e.g. "0x2d=1234 0x69=987", counts per frame.
+    static std::string TopOps(std::array<std::atomic<u64>, 256>& ops, u32 frames, size_t top) {
+        std::vector<std::pair<u64, u32>> list;
+        for (u32 op = 0; op < ops.size(); ++op) {
+            if (const u64 n = ops[op].exchange(0)) {
+                list.emplace_back(n, op);
+            }
+        }
+        std::sort(list.begin(), list.end(), std::greater<>{});
+        std::string out;
+        for (size_t i = 0; i < std::min(top, list.size()); ++i) {
+            out += fmt::format("{}{:#04x}={:.0f}", out.empty() ? "" : " ", list[i].second,
+                               double(list[i].first) / std::max(frames, 1u));
+        }
+        return out.empty() ? "none" : out;
+    }
+
+    /// Assembly-line planning statistics, as counts per frame.
+    static void DumpPipe(u32 frames) {
+        auto& p = VideoCore::ReadbackTrace::Pipe();
+        const double f = std::max(frames, 1u);
+        const auto per = [f](std::atomic<u64>& c) { return double(c.exchange(0)) / f; };
+        using VideoCore::ReadbackTrace::EpochSource;
+        const auto src = [&](EpochSource e) { return per(p.epoch_by_source[size_t(e)]); };
+        LOG_INFO(Render,
+                 "[pipe-trace] per_frame: frames={} gfx_submits={:.1f} asc_submits={:.1f} "
+                 "commands={:.1f} blocking_commands={:.1f} flushes={:.1f} finishes={:.1f} "
+                 "waits={:.1f} render_begins={:.0f} render_ends={:.0f} stream_epoch_misses={:.0f} "
+                 "stream_epoch_miss_kb={:.0f} epoch_src pkt={:.0f} newbuf={:.0f} cmd={:.1f} "
+                 "writeback={:.1f} map={:.1f} unmark={:.1f} constram={:.0f}",
+                 frames, per(p.gfx_submits), per(p.asc_submits), per(p.commands),
+                 per(p.blocking_commands), per(p.flushes), per(p.finishes), per(p.waits),
+                 per(p.render_begins), per(p.render_ends), per(p.stream_epoch_misses),
+                 per(p.stream_epoch_miss_bytes) / 1024.0, src(EpochSource::Packet),
+                 src(EpochSource::NewBuffer), src(EpochSource::Command),
+                 src(EpochSource::WriteBack), src(EpochSource::MapChange),
+                 src(EpochSource::Unmark), src(EpochSource::ConstRam));
+        LOG_INFO(Render,
+                 "[pipe-trace] copy_worker per_frame: copies={:.0f} copy_kb={:.0f} "
+                 "full_drains={:.0f} overlap_drains={:.0f} wait_us={:.0f}",
+                 per(p.worker_copies), per(p.worker_copy_bytes) / 1024.0,
+                 per(p.worker_full_drains), per(p.worker_overlap_drains),
+                 per(p.worker_wait_ns) / 1000.0);
+        LOG_INFO(Render, "[pipe-trace] gfx_ops_per_frame: {}", TopOps(p.gfx_ops, frames, 24));
+        LOG_INFO(Render, "[pipe-trace] asc_ops_per_frame: {}", TopOps(p.asc_ops, frames, 12));
+        LOG_INFO(Render, "[pipe-trace] ce_ops_per_frame: {}", TopOps(p.ce_ops, frames, 8));
+    }
+
+    void Dump() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_dump < std::chrono::seconds(2)) {
+            return;
+        }
+        const double secs = std::chrono::duration<double>(now - last_dump).count();
+        const u32 flips = DebugState.GetFrameNum();
+        const std::string opts_now = ActiveOpts();
+        last_dump = now;
+        auto& c = VideoCore::ReadbackTrace::Counters();
+        LOG_INFO(Render,
+                 "[barrier-trace] fps={:.1f} draws_per_frame={:.0f} dispatches_per_frame={:.0f} "
+                 "opts={} full_calls={} partial_calls={} memo_hits={} "
+                 "subresources_visited={} barriers={} find_hits={} find_misses={} "
+                 "registry_changes={} access_adds={} access_new_ranges={} desc_hits={} "
+                 "desc_misses={} desc_copy_skips={} stream_copies={} stream_copy_kb={} stream_reuses={} "
+                 "stream_reuse_kb={} epoch_bumps={}",
+                 (flips - last_flips) / secs, DebugState.GetDrawCallsAvg(),
+                 DebugState.GetDispatchesAvg(),
+                 opts_at_start == opts_now ? opts_now : std::string{"mixed"},
+                 full_calls.exchange(0), partial_calls.exchange(0), memo_hits.exchange(0),
+                 visited.exchange(0), barriers.exchange(0), c.find_hits.exchange(0),
+                 c.find_misses.exchange(0), c.registry_changes.exchange(0),
+                 c.access_adds.exchange(0), c.access_merges.exchange(0), c.desc_hits.exchange(0),
+                 c.desc_misses.exchange(0), c.desc_copy_skips.exchange(0),
+                 c.stream_copies.exchange(0),
+                 c.stream_copy_bytes.exchange(0) / 1024, c.stream_reuses.exchange(0),
+                 c.stream_reuse_bytes.exchange(0) / 1024, c.epoch_bumps.exchange(0));
+        DumpPipe(flips - last_flips);
+        last_flips = flips;
+        opts_at_start = opts_now;
+        std::vector<std::pair<const void*, PerImage>> top(images.begin(), images.end());
+        std::sort(top.begin(), top.end(),
+                  [](const auto& a, const auto& b) { return a.second.visited > b.second.visited; });
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 6); ++i) {
+            const auto& p = top[i].second;
+            LOG_INFO(Render,
+                     "[barrier-trace]   image {}x{}x{} type={} levels={} layers={} calls={} "
+                     "hits={} visited={} last_range=mip {}+{} layer {}+{}",
+                     p.width, p.height, p.depth, p.type, p.levels, p.layers, p.calls, p.hits,
+                     p.visited, p.range.base.level, p.range.extent.levels, p.range.base.layer,
+                     p.range.extent.layers);
+        }
+        images.clear();
+    }
+};
+
+BarrierStats& GetBarrierStats() {
+    static BarrierStats stats;
+    return stats;
+}
+
+} // Anonymous namespace
+
 void Image::GetBarriers(Barriers& barriers, BackingImage& image_backing, vk::ImageLayout dst_layout,
                         vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
@@ -256,10 +425,40 @@ void Image::GetBarriers(Barriers& barriers, BackingImage& image_backing, vk::Ima
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
 
+    constexpr auto memo_write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                      vk::AccessFlagBits2::eShaderWrite |
+                                      vk::AccessFlagBits2::eMemoryWrite;
+    const bool tracing = VideoCore::ReadbackTrace::TraceBarriers();
+    const size_t barriers_before = barriers.size();
+
+    // Local optimization: a read-only partial transition that already ran with no state change
+    // since then would visit every subresource in the range and find nothing to do. Skip the walk
+    // (last_state is still updated below, exactly as the walk would leave it).
+    const bool use_memo = VideoCore::ReadbackTrace::BarrierMemo() && needs_partial_transition &&
+                          !(dst_mask & memo_write_flags);
+    if (use_memo && partially_transited) {
+        for (const auto& memo : image_backing.noop_memo) {
+            if (memo.version == image_backing.state_version && memo.range == *subres_range &&
+                memo.layout == dst_layout && memo.access_mask == dst_mask) {
+                if (tracing) {
+                    auto& s = GetBarrierStats();
+                    VideoCore::ReadbackTrace::Add(s.partial_calls, 1);
+                    VideoCore::ReadbackTrace::Add(s.memo_hits, 1);
+                    s.MaybeDump();
+                }
+                last_state.layout = dst_layout;
+                last_state.access_mask = dst_mask;
+                last_state.pl_stage = dst_stage;
+                return;
+            }
+        }
+    }
+
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+            ++image_backing.state_version;
         }
 
         // In case of partial transition, we need to change the specified subresources only.
@@ -311,10 +510,50 @@ void Image::GetBarriers(Barriers& barriers, BackingImage& image_backing, vk::Ima
             }
         }
 
+        if (barriers.size() != barriers_before) {
+            ++image_backing.state_version;
+        }
+        if (tracing) {
+            auto& s = GetBarrierStats();
+            const u64 visited = u64(end_mip - start_mip) * (end_layer - start_layer);
+            VideoCore::ReadbackTrace::Add(s.partial_calls, 1);
+            VideoCore::ReadbackTrace::Add(s.visited, visited);
+            VideoCore::ReadbackTrace::Add(s.barriers, barriers.size() - barriers_before);
+            std::scoped_lock lk{s.mutex};
+            auto& p = s.images[this];
+            ++p.calls;
+            p.visited += visited;
+            p.levels = info.resources.levels;
+            p.layers = info.resources.layers;
+            p.range = subres_range ? *subres_range : SubresourceRange{};
+            p.width = info.size.width;
+            p.height = info.size.height;
+            p.depth = info.size.depth;
+            p.type = static_cast<u32>(info.type);
+            s.Dump();
+        }
+
         if (!needs_partial_transition) {
             subresource_states.clear();
+            ++image_backing.state_version;
+        } else if (use_memo) {
+            // Every subresource in the range is now in (dst_layout, dst_mask) without write
+            // access, so repeating this exact transition is a no-op until the state changes.
+            auto& memo = image_backing.noop_memo[image_backing.noop_memo_next++ %
+                                                 image_backing.noop_memo.size()];
+            memo = NoopTransition{
+                .range = *subres_range,
+                .layout = dst_layout,
+                .access_mask = dst_mask,
+                .version = image_backing.state_version,
+            };
         }
     } else { // Full resource transition
+        if (tracing) {
+            auto& s = GetBarrierStats();
+            VideoCore::ReadbackTrace::Add(s.full_calls, 1);
+            s.MaybeDump();
+        }
         constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
                                      vk::AccessFlagBits2::eShaderWrite |
                                      vk::AccessFlagBits2::eMemoryWrite;
@@ -340,6 +579,7 @@ void Image::GetBarriers(Barriers& barriers, BackingImage& image_backing, vk::Ima
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         });
+        ++image_backing.state_version;
     }
 
     last_state.layout = dst_layout;

@@ -6,6 +6,7 @@
 
 #include "common/hash.h"
 #include "common/io_file.h"
+#include "video_core/readback_trace.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -389,10 +390,15 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        const auto compile_start = std::chrono::steady_clock::now();
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        VideoCore::ReadbackTrace::RecordCompile(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 compile_start)
+                .count());
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -418,10 +424,15 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
+        const auto compile_start = std::chrono::steady_clock::now();
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
+        VideoCore::ReadbackTrace::RecordCompile(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 compile_start)
+                .count());
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

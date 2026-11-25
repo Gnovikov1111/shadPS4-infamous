@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -35,6 +36,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().render_begins);
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -88,6 +90,7 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().render_ends);
     CommandBuffer().endRendering();
 }
 
@@ -116,13 +119,28 @@ void Scheduler::Flush() {
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
+    const bool tracing = VideoCore::ReadbackTrace::Enabled();
+    const auto t0 =
+        tracing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const u64 presubmit_tick = CurrentTick();
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().finishes);
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
+    if (tracing) {
+        VideoCore::ReadbackTrace::RecordFinish(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count()));
+    }
 }
 
 void Scheduler::Wait(u64 tick) {
+    VideoCore::ReadbackTrace::GpuWaitScope gpu_wait{VideoCore::ReadbackTrace::GpuWait::GpuSemaphore,
+                                                    tick};
+    if (VideoCore::ReadbackTrace::TraceBarriers() && !work_semaphore.IsFree(tick)) {
+        VideoCore::ReadbackTrace::Add(VideoCore::ReadbackTrace::Pipe().waits);
+    }
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -187,6 +205,7 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().flushes);
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 

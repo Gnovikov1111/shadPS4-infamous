@@ -16,6 +16,8 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/buffer_cache/copy_worker.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -64,6 +66,46 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     }
 
     return span.subspan(offset);
+}
+
+/// Packets that only set registers, draw or dispatch: guest memory holds the same data after them
+/// (SHADPS4_STREAM_DEDUPE). Any other packet may write guest memory or wait for the guest, so the
+/// guest memory epoch is bumped around it. EventWrite ZpassDone and flip NOPs bump explicitly.
+static bool KeepsGuestMemory(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectCountMulti:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::EventWrite:
+        return true;
+    default:
+        return false;
+    }
 }
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
@@ -117,13 +159,50 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
-        callback();
+        // Readbacks and other queued work may write guest memory or signal the guest.
+        VideoCore::CopyWorker::Instance().Drain();
+        {
+            VideoCore::ReadbackTrace::GpuWaitScope cmd{VideoCore::ReadbackTrace::GpuWait::Command};
+            callback();
+        }
+        // Queued commands (readback flushes, map changes...) may change guest memory.
+        VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(VideoCore::ReadbackTrace::EpochSource::Command);
+        VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().commands);
     }
 }
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    VideoCore::ReadbackTrace::GpuThreadId().store(gpu_id);
+    // Watchdog (local investigation): reports what the GPU command thread waits on if it stops
+    // processing packets while it is not idle.
+    static std::jthread watchdog([this](std::stop_token stop) {
+        Common::SetCurrentThreadName("shadPS4:GpuWatchdog");
+        namespace RT = VideoCore::ReadbackTrace;
+        u64 last = RT::GpuProgress().load();
+        u32 stalled = 0;
+        while (!stop.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const u64 now = RT::GpuProgress().load();
+            const u32 state = RT::GpuWaitState().load();
+            if (now != last || state == static_cast<u32>(RT::GpuWait::Idle)) {
+                last = now;
+                stalled = 0;
+                continue;
+            }
+            ++stalled;
+            if (stalled == 3 || stalled == 10 || stalled % 60 == 0) {
+                LOG_CRITICAL(Render,
+                             "[gpu-watchdog] GPU command thread made no progress for {} s: "
+                             "state={} wait_addr={:#x} num_submits={} num_commands={} "
+                             "copy_worker: {}",
+                             stalled, RT::GpuWaitName(state), RT::GpuWaitAddr().load(),
+                             u64(num_submits), u64(num_commands),
+                             VideoCore::CopyWorker::Instance().DebugState());
+            }
+        }
+    });
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
@@ -131,6 +210,7 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
+            VideoCore::ReadbackTrace::GpuWaitScope idle{VideoCore::ReadbackTrace::GpuWait::Idle};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
         }
@@ -181,6 +261,8 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
+        // GpuIdle lets the guest reuse submitted memory: queued copies must have read it first.
+        VideoCore::CopyWorker::Instance().Drain();
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
@@ -203,6 +285,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        VideoCore::ReadbackTrace::Count(
+            VideoCore::ReadbackTrace::Pipe().ce_ops[static_cast<u32>(opcode) & 0xFF]);
         // Read the size before running the packet: once it signals the guest, the guest may
         // already reuse the buffer.
         const u32 packet_words = header->type3.NumWords() + 1;
@@ -220,8 +304,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
+            VideoCore::CopyWorker::Instance().DrainOverlapping(dump_const->Address<VAddr>(),
+                                                          dump_const->Size());
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                VideoCore::ReadbackTrace::EpochSource::ConstRam);
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -274,6 +362,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
     FIBER_ENTER(dcb_task_name);
+    VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+        VideoCore::ReadbackTrace::EpochSource::NewBuffer); // new command buffer
 
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
@@ -297,6 +387,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            VideoCore::ReadbackTrace::Count(
+                VideoCore::ReadbackTrace::Pipe().gfx_ops[static_cast<u32>(opcode) & 0xFF]);
+            VideoCore::ReadbackTrace::Add(VideoCore::ReadbackTrace::GpuProgress());
+            const bool may_change_memory = !KeepsGuestMemory(opcode);
+            if (may_change_memory) {
+                VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                    VideoCore::ReadbackTrace::EpochSource::Packet);
+                // DmaData waits only for overlapping copies (in Rasterizer::Fill/CopyBuffer).
+                if (opcode != PM4ItOpcode::DmaData) {
+                    VideoCore::CopyWorker::Instance().Drain();
+                }
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -308,7 +410,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
+                    VideoCore::CopyWorker::Instance().Drain();
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                    VideoCore::ReadbackTrace::EpochSource::Packet);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -711,10 +816,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
+                        VideoCore::CopyWorker::Instance().DrainOverlapping(event->Address<VAddr>(),
+                                                                  num_counter_pairs * 16ULL);
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
                         pixel_counter += OcclusionCounterStep;
+                        VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                    VideoCore::ReadbackTrace::EpochSource::Packet);
                     }
                 }
                 break;
@@ -849,11 +958,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    VideoCore::ReadbackTrace::GpuWaitScope vo_wait{
+                        VideoCore::ReadbackTrace::GpuWait::VoLabel, u64(wait_addr)};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    VideoCore::ReadbackTrace::GpuWaitAddr().store(u64(wait_addr));
+                    VideoCore::ReadbackTrace::GpuWaitState().store(
+                        u32(VideoCore::ReadbackTrace::GpuWait::GuestWait));
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        YIELD_GFX();
+                    }
+                    VideoCore::ReadbackTrace::GpuWaitState().store(
+                        u32(VideoCore::ReadbackTrace::GpuWait::Running));
                 }
                 break;
             }
@@ -956,6 +1074,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
+            if (may_change_memory) {
+                VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                    VideoCore::ReadbackTrace::EpochSource::Packet);
+            }
             // The size read before running the packet: a flip or an EOP interrupt lets the guest
             // reuse this buffer while we are still on it, so the header may be gone by now.
             dcb = NextPacket(dcb, count + 1);
@@ -969,6 +1091,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+        VideoCore::ReadbackTrace::EpochSource::NewBuffer); // new command buffer
     auto& queue = asc_queues[{vqid}];
 
     struct IndirectPatch {
@@ -1022,6 +1146,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        VideoCore::ReadbackTrace::Count(
+            VideoCore::ReadbackTrace::Pipe().asc_ops[static_cast<u32>(opcode) & 0xFF]);
+        VideoCore::ReadbackTrace::Add(VideoCore::ReadbackTrace::GpuProgress());
+        const bool may_change_memory = !KeepsGuestMemory(opcode);
+        if (may_change_memory) {
+            VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                VideoCore::ReadbackTrace::EpochSource::Packet);
+            if (opcode != PM4ItOpcode::DmaData) {
+                VideoCore::CopyWorker::Instance().Drain();
+            }
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1208,8 +1343,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                VideoCore::ReadbackTrace::GpuWaitAddr().store(
+                    u64(wait_reg_mem->Address<u64*>()));
+                VideoCore::ReadbackTrace::GpuWaitState().store(
+                    u32(VideoCore::ReadbackTrace::GpuWait::GuestWait));
+                while (!wait_reg_mem->Test(regs.reg_array)) {
+                    YIELD_ASC(vqid);
+                }
+                VideoCore::ReadbackTrace::GpuWaitState().store(
+                    u32(VideoCore::ReadbackTrace::GpuWait::Running));
             }
             break;
         }
@@ -1241,6 +1384,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             static_cast<u32>(opcode), header->type3.NumWords());
         }
 
+        if (may_change_memory) {
+            VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(
+                    VideoCore::ReadbackTrace::EpochSource::Packet);
+        }
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
@@ -1291,6 +1438,7 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().gfx_submits);
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
@@ -1311,6 +1459,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().asc_submits);
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     auto& queue = mapped_queues[gnm_vqid];
 

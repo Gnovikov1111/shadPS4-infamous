@@ -55,6 +55,40 @@ public:
         });
     }
 
+    /// Mark the pages of a region that the GPU has not modified as CPU modified (unprotecting
+    /// them), leaving GPU-modified pages untouched. Used to widen a CPU write fault to the pages
+    /// that follow it, so a sequential CPU writer takes one fault per window instead of per page.
+    void MarkRegionAsCpuModifiedIfNotGpu(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            const auto bounds = manager->GetBounds(offset, size);
+            manager->Lock(bounds);
+            u64 run_start = offset;
+            u64 run_size = 0;
+            for (u64 off = offset; off < offset + size;) {
+                const u64 len = std::min<u64>(BYTES_PER_PAGE - (off % BYTES_PER_PAGE),
+                                              offset + size - off);
+                if (manager->template IsRegionModified<Type::GPU>(off, len)) {
+                    if (run_size) {
+                        manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(
+                            run_start, run_size);
+                    }
+                    run_size = 0;
+                } else {
+                    if (!run_size) {
+                        run_start = off;
+                    }
+                    run_size += len;
+                }
+                off += len;
+            }
+            if (run_size) {
+                manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(run_start,
+                                                                                        run_size);
+            }
+            manager->Unlock(bounds);
+        });
+    }
+
     /// Mark region as modified from the CPU
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {

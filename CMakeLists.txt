@@ -1472,6 +1472,13 @@ if (WIN32)
     else()
         target_link_options(shadps4 PRIVATE -Wl,--image-base=0x700000000000)
     endif()
+
+    # Local profiling aid: line-table debug info + PDB so profilers can name functions.
+    # Debug info does not change generated code; /OPT:REF,ICF keep the usual link behaviour.
+    if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        target_compile_options(shadps4 PRIVATE -gline-tables-only -gcodeview)
+        target_link_options(shadps4 PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    endif()
 endif()
 
 if (WIN32)

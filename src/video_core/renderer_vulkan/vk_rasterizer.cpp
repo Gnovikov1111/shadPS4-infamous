@@ -10,6 +10,8 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/copy_worker.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -51,6 +53,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+        // Assembly line: queued guest-memory copies must land before the GPU reads them.
+        VideoCore::CopyWorker::Instance().Drain();
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
@@ -418,6 +422,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    VideoCore::ReadbackTrace::Tick();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -425,7 +430,13 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    VideoCore::ReadbackTrace::RecordFence();
     texture_cache.ProcessDownloadImages();
+    if (VideoCore::ReadbackTrace::EopFinish()) {
+        // Experiment: make the fence honest by letting the host GPU finish the recorded work
+        // before the guest is told it is done.
+        scheduler.Finish();
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -882,6 +893,43 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+void Rasterizer::MakeImageDesc(u32 slot, VideoCore::TextureCache::ImageDesc& desc,
+                               const AmdGpu::Image& tsharp,
+                               const Shader::ImageResource& image_desc) {
+    static_assert(sizeof(AmdGpu::Image) == sizeof(ImageDescCacheEntry::sharp));
+    std::array<u64, 4> sharp;
+    std::memcpy(sharp.data(), &tsharp, sizeof(sharp));
+    const u32 flags = u32(image_desc.is_depth) | (u32(image_desc.is_written) << 1) |
+                      (u32(image_desc.is_array) << 2);
+    u64 h = (sharp[0] ^ (sharp[1] * 0x9E3779B97F4A7C15ULL) ^ (sharp[2] * 0xC2B2AE3D27D4EB4FULL) ^
+             (sharp[3] * 0x165667B19E3779F9ULL) ^ flags) *
+            0xFF51AFD7ED558CCDULL;
+    h ^= h >> 31;
+    auto& entry = image_desc_cache[h & (ImageDescCacheSize - 1)];
+    if (entry.valid && entry.flags == flags && entry.sharp == sharp) {
+        VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().desc_hits);
+        if (slot_desc_src[slot] == &entry && slot_desc_version[slot] == entry.version &&
+            VideoCore::ReadbackTrace::DescSlotReuse()) {
+            // The slot still holds an unmodified copy of exactly this description.
+            VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().desc_copy_skips);
+            return;
+        }
+        desc = entry.desc;
+        slot_desc_src[slot] = &entry;
+        slot_desc_version[slot] = entry.version;
+        return;
+    }
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().desc_misses);
+    std::construct_at(&desc, tsharp, image_desc);
+    entry.sharp = sharp;
+    entry.flags = flags;
+    entry.desc = desc;
+    entry.valid = true;
+    ++entry.version;
+    slot_desc_src[slot] = &entry;
+    slot_desc_version[slot] = entry.version;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -914,19 +962,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const u32 num_bindings = image_desc.NumBindings(stage);
 
         for (auto i = 0; i < num_bindings; i++) {
+            const u32 slot = num_images;
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
+            if (VideoCore::ReadbackTrace::ImageDescCache()) {
+                MakeImageDesc(slot, desc, tsharp, image_desc);
+            } else {
+                std::construct_at(&desc, tsharp, image_desc);
+                slot_desc_src[slot] = nullptr;
+            }
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
                 desc.view_info.range.base.level += image_desc.constant_mip_index;
                 desc.view_info.range.extent.levels = 1;
+                slot_desc_src[slot] = nullptr;
             } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
                 desc.view_info.range.base.level += i;
                 desc.view_info.range.extent.levels = 1;
+                slot_desc_src[slot] = nullptr;
             }
 
+            const auto range_before_find = desc.view_info.range;
             image_id = texture_cache.FindImage(desc);
+            if (!(desc.view_info.range == range_before_find)) {
+                slot_desc_src[slot] = nullptr; // FindImage pointed the view at a sub-resource
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -960,7 +1020,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 (desc.IsSubrectTexture(old_image.info) &&
                  False(old_image.flags & VideoCore::ImageFlagBits::Registered))) {
                 old_image.binding = {};
+                const auto range_before_find = desc.view_info.range;
                 image_id = texture_cache.FindImage(desc);
+                if (!(desc.view_info.range == range_before_find)) {
+                    slot_desc_src[i] = nullptr;
+                }
             }
 
             bound_images.emplace_back(image_id);
@@ -1257,6 +1321,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            VideoCore::CopyWorker::Instance().DrainOverlapping(address, num_bytes);
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -1277,6 +1342,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            VideoCore::CopyWorker::Instance().DrainOverlapping(dst, num_bytes);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
@@ -1323,6 +1389,23 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+void Rasterizer::WidenCpuWriteFault(VAddr fault_addr, u64 pages) {
+    // Experiment (SHADPS4_FAULT_WIDEN_PAGES): after a CPU write fault, release the following
+    // pages that the GPU has not modified, so a sequential CPU writer does not fault per page.
+    // The texture cache is told about the released range up front, because later writes to it
+    // will no longer fault.
+    if (pages < 2) {
+        return;
+    }
+    const VAddr start = VideoCore::PageManager::GetNextPageAddr(fault_addr);
+    const u64 size = (pages - 1) * VideoCore::PageManager::GetPageSize();
+    if (!IsMapped(start, size)) {
+        return;
+    }
+    buffer_cache.MarkRegionAsCpuModifiedIfNotGpu(start, size);
+    texture_cache.InvalidateMemory(start, size);
+}
+
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -1348,6 +1431,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(VideoCore::ReadbackTrace::EpochSource::MapChange);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -1359,6 +1443,9 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    VideoCore::ReadbackTrace::BumpGuestMemoryEpoch(VideoCore::ReadbackTrace::EpochSource::MapChange);
+    // Queued copies may still read this memory; it is freed after this returns.
+    VideoCore::CopyWorker::Instance().Drain();
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {

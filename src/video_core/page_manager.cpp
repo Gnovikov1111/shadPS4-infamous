@@ -15,6 +15,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -436,10 +437,32 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        const bool tracing = ReadbackTrace::Enabled();
+        const auto t0 = tracing ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+        const auto elapsed_ns = [&] {
+            return tracing ? static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - t0)
+                                                  .count())
+                           : 0;
+        };
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            const bool handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            if (handled && !is_gpu_thread) {
+                if (const u64 widen = ReadbackTrace::FaultWidenPages(); widen > 1) {
+                    rasterizer->WidenCpuWriteFault(addr, widen);
+                }
+            }
+            if (handled) {
+                ReadbackTrace::RecordFault(addr, true, is_gpu_thread, elapsed_ns());
+            }
+            return handled;
         } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            const bool handled = rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            if (handled) {
+                ReadbackTrace::RecordFault(addr, false, is_gpu_thread, elapsed_ns());
+            }
+            return handled;
         }
         return false;
     }

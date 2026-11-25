@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  21:9 patches for inFAMOUS Second Son 01.07 (CUSA00004), base PS4 mode (keep PS4 Pro / Neo mode OFF).
+  Enable ONE "Ultrawide" entry at a time, and do not combine with the official "Render resolution" patches.
+  The "Disable ..." entries can be combined with any Ultrawide entry.
+
+  Ultrawide lines (addresses are for the unwrapped 01.07 eboot):
+    startup   0x1eff47/0x1eff4e  render W/H  [res+0xc]/[res+0x10]
+              0x1eff55/0x1eff5b  output W/H  [res+0x0]/[res+0x4]  -> display buffers (sceVideoOutSetBufferAttribute)
+    mode set  0x1f0d3d/0x1f0d4c  base-mode render W/H (esi/edi)
+              0x1f0d38/0x1f0d47  output W/H (ebx/ecx) + NOP of the two cmoves that copy render size into output size
+                                 (only in the split render/output entries, same technique as the official resolution patch)
+    globals   0x1f03ff/0x1f03f8  display W/H 0x1d0ccc0/0x1d0ccc4 (HUD scale, safe area)
+-->
+<Patch>
+    <TitleID>
+        <ID>CUSA00004</ID>
+    </TitleID>
+    <Metadata Title="inFAMOUS Second Son"
+              Name="Ultrawide 21:9 3440x1440 output, 2752x1152 render (80%)"
+              Note="Display output 3440x1440 (HUD at full resolution), 3D rendered at 80% and upscaled by the game. About 36% fewer pixels to render than full 3440x1440."
+              Author="prototype"
+              PatchVer="0.2"
+              AppVer="01.07"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="mask" Address="80 07 00 00 C7 43 10" Offset="0" Value="C00A0000"/>
+            <Line Type="mask" Address="38 04 00 00 C7 03" Offset="0" Value="80040000"/>
+            <Line Type="mask" Address="C7 03 80 07 00 00 C7 43 04" Offset="2" Value="700D0000"/>
+            <Line Type="mask" Address="C7 43 04 38 04 00 00 C6 83 05 0F DF 00 00" Offset="3" Value="A0050000"/>
+            <Line Type="mask" Address="00 0F 00 00 BE" Offset="0" Value="700D0000"/>
+            <Line Type="mask" Address="70 08 00 00 BF" Offset="0" Value="A0050000"/>
+            <Line Type="mask" Address="80 07 00 00 B8 80 0C" Offset="0" Value="C00A0000"/>
+            <Line Type="mask" Address="38 04 00 00 BA 08 07" Offset="0" Value="80040000"/>
+            <Line Type="mask" Address="0F 44 DE 0F 44" Offset="0" Value="909090"/>
+            <Line Type="mask" Address="0F 44 CF 0F 44" Offset="0" Value="909090"/>
+            <Line Type="mask" Address="41 C7 07 38 04 00 00 41 C7 04 24" Offset="3" Value="A0050000"/>
+            <Line Type="mask" Address="41 C7 04 24 80 07 00 00 E8" Offset="4" Value="700D0000"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="inFAMOUS Second Son"
+              Name="Ultrawide 21:9 3440x1440 output, 2560x1072 render (75%)"
+              Note="Display output 3440x1440 (HUD at full resolution), 3D rendered at 75% and upscaled by the game. About 45% fewer pixels to render than full 3440x1440."
+              Author="prototype"
+              PatchVer="0.2"
+              AppVer="01.07"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="mask" Address="80 07 00 00 C7 43 10" Offset="0" Value="000A0000"/>
+            <Line Type="mask" Address="38 04 00 00 C7 03" Offset="0" Value="30040000"/>
+            <Line Type="mask" Address="C7 03 80 07 00 00 C7 43 04" Offset="2" Value="700D0000"/>
+            <Line Type="mask" Address="C7 43 04 38 04 00 00 C6 83 05 0F DF 00 00" Offset="3" Value="A0050000"/>
+            <Line Type="mask" Address="00 0F 00 00 BE" Offset="0" Value="700D0000"/>
+            <Line Type="mask" Address="70 08 00 00 BF" Offset="0" Value="A0050000"/>
+            <Line Type="mask" Address="80 07 00 00 B8 80 0C" Offset="0" Value="000A0000"/>
+            <Line Type="mask" Address="38 04 00 00 BA 08 07" Offset="0" Value="30040000"/>
+            <Line Type="mask" Address="0F 44 DE 0F 44" Offset="0" Value="909090"/>
+            <Line Type="mask" Address="0F 44 CF 0F 44" Offset="0" Value="909090"/>
+            <Line Type="mask" Address="41 C7 07 38 04 00 00 41 C7 04 24" Offset="3" Value="A0050000"/>
+            <Line Type="mask" Address="41 C7 04 24 80 07 00 00 E8" Offset="4" Value="700D0000"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="inFAMOUS Second Son"
+              Name="Ultrawide 21:9 3440x1440 (full resolution)"
+              Note="Render and display output 3440x1440 (base PS4 mode). Heaviest option."
+              Author="prototype"
+              PatchVer="0.2"
+              AppVer="01.07"
+              AppElf="eboot.bin"
+              isEnabled="true">
+        <PatchList>
+            <Line Type="mask" Address="80 07 00 00 C7 43 10" Offset="0" Value="700D0000"/>
+            <Line Type="mask" Address="38 04 00 00 C7 03" Offset="0" Value="A0050000"/>
+            <Line Type="mask" Address="C7 03 80 07 00 00 C7 43 04" Offset="2" Value="700D0000"/>
+            <Line Type="mask" Address="C7 43 04 38 04 00 00 C6 83 05 0F DF 00 00" Offset="3" Value="A0050000"/>
+            <Line Type="mask" Address="80 07 00 00 B8 80 0C" Offset="0" Value="700D0000"/>
+            <Line Type="mask" Address="38 04 00 00 BA 08 07" Offset="0" Value="A0050000"/>
+            <Line Type="mask" Address="41 C7 07 38 04 00 00 41 C7 04 24" Offset="3" Value="A0050000"/>
+            <Line Type="mask" Address="41 C7 04 24 80 07 00 00 E8" Offset="4" Value="700D0000"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="inFAMOUS Second Son"
+              Name="Ultrawide 21:9 2560x1080 (render and output)"
+              Note="Render and display output 2560x1080; shadPS4 scales it to the screen."
+              Author="prototype"
+              PatchVer="0.2"
+              AppVer="01.07"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="mask" Address="80 07 00 00 C7 43 10" Offset="0" Value="000A0000"/>
+            <Line Type="mask" Address="C7 03 80 07 00 00 C7 43 04" Offset="2" Value="000A0000"/>
+            <Line Type="mask" Address="80 07 00 00 B8 80 0C" Offset="0" Value="000A0000"/>
+            <Line Type="mask" Address="41 C7 04 24 80 07 00 00 E8" Offset="4" Value="000A0000"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="inFAMOUS Second Son"
+              Name="Disable motion blur (from shadPS4 patch repo)"
+              Note="Copied unchanged from shadps4-emu/ps4_cheats PATCHES/InfamousSecondSon.xml (author junminlee2004). Skips the blur passes."
+              Author="junminlee2004"
+              PatchVer="1.1"
+              AppVer="01.07"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="mask" Address="0F 85 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 80 38 00 0F 85 ?? ?? ?? ??" Offset="0" Value="E98B04000090"/>
+            <Line Type="mask" Address="0F 83 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? C5 FA 10 88 AC 00 00 00" Offset="0" Value="E9FD02000090"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="inFAMOUS Second Son"
+              Name="Disable depth of field (from shadPS4 patch repo)"
+              Note="Copied unchanged from shadps4-emu/ps4_cheats PATCHES/InfamousSecondSon.xml (author junminlee2004). Skips the bokeh/DOF passes."
+              Author="junminlee2004"
+              PatchVer="1.2"
+              AppVer="01.07"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="mask" Address="0F 85 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? C5 F0 57 C9 C5 FA 10 80 54 01 00 00" Offset="0" Value="E90206000090"/>
+        </PatchList>
+    </Metadata>
+</Patch>

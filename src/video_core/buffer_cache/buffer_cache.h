@@ -120,6 +120,9 @@ public:
     /// Mark region as modified from the GPU
     void MarkRegionAsGpuModified(VAddr addr, size_t size);
 
+    /// Unprotects the CPU-tracked, non-GPU-modified pages of a region (fault widening).
+    void MarkRegionAsCpuModifiedIfNotGpu(VAddr addr, size_t size);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -161,6 +164,17 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
+    /// SHADPS4_STREAM_DEDUPE: where the last stream copy of (address, size) lives, valid while the
+    /// guest memory epoch and the stream buffer generation are unchanged.
+    struct StreamCopy {
+        VAddr device_addr{};
+        u64 size{};
+        u64 offset{};
+        u64 epoch{};
+        u64 generation{};
+    };
+    static constexpr size_t StreamCopyTableBits = 12;
+    std::array<StreamCopy, size_t{1} << StreamCopyTableBits> stream_copies{};
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;

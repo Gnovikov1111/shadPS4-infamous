@@ -13,6 +13,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/readback_trace.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -606,6 +607,40 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     ASSERT(info.guest_address != 0);
 
+    // Local optimization: the exact-match result below depends only on the request fields in
+    // the key and on the set of registered images, so reuse it while no image was (un)registered.
+    const bool use_find_cache = VideoCore::ReadbackTrace::FindImageCache();
+    FindImageEntry* cache_entry = nullptr;
+    const FindImageKey cache_key{
+        .guest_address = info.guest_address,
+        .guest_size = info.guest_size,
+        .size = info.size,
+        .pixel_format = info.pixel_format,
+        .type = info.type,
+        .resources = info.resources,
+        .exact_fmt = exact_fmt,
+    };
+    if (use_find_cache) {
+        u64 h = info.guest_address * 0x9E3779B97F4A7C15ULL;
+        h ^= (u64(info.guest_size) << 17) ^ (u64(info.size.width) << 40) ^
+             (u64(info.size.height) << 24) ^ info.size.depth;
+        h ^= (u64(static_cast<u32>(info.pixel_format)) << 8) ^ (u64(info.type) << 4) ^
+             (u64(info.resources.levels) << 48) ^ (u64(info.resources.layers) << 32) ^
+             u64(exact_fmt);
+        h *= 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 29;
+        cache_entry = &find_image_cache[h & (FindImageCacheSize - 1)];
+        if (cache_entry->epoch == registry_epoch && cache_entry->key == cache_key) {
+            VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().find_hits);
+            Image& image = slot_images[cache_entry->image_id];
+            image.tick_accessed_last = scheduler.CurrentTick();
+            TouchImage(image);
+            return cache_entry->image_id;
+        }
+        VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().find_misses);
+    }
+    const u64 epoch_at_start = registry_epoch;
+
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -637,6 +672,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         image_id = cache_id;
     }
+    const ImageId perfect_match = image_id;
 
     if (!image_id) {
         image_id = subrect_source;
@@ -682,6 +718,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
+
+    // Cache only results that came straight from the exact-match scan with nothing registered or
+    // freed on the way (those are the cases the fast path above reproduces exactly).
+    if (cache_entry && perfect_match && image_id == perfect_match &&
+        registry_epoch == epoch_at_start) {
+        *cache_entry = FindImageEntry{
+            .key = cache_key,
+            .image_id = image_id,
+            .epoch = registry_epoch,
+        };
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
@@ -957,6 +1004,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
+    ++registry_epoch; // invalidates find_image_cache
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().registry_changes);
     image.flags |= ImageFlagBits::Registered;
     image.memory_usage_counter = &total_used_memory;
     total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
@@ -976,6 +1025,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
+    ++registry_epoch; // invalidates find_image_cache
+    VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Counters().registry_changes);
     image.flags &= ~ImageFlagBits::Registered;
     image.memory_usage_counter = nullptr;
     image_lru_cache.Free(image);

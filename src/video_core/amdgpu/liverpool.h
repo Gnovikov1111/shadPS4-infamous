@@ -20,6 +20,7 @@
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/readback_trace.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -100,6 +101,7 @@ public:
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if constexpr (wait_done) {
+            VideoCore::ReadbackTrace::Count(VideoCore::ReadbackTrace::Pipe().blocking_commands);
             std::binary_semaphore sem{0};
             {
                 std::scoped_lock lk{submit_mutex};
@@ -122,7 +124,9 @@ public:
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
-        constexpr size_t GfxReservedSize = 2_MB >> 2;
+        // Upstream reserves 2 MB; SHADPS4_COPY_RESERVE_MB raises it for titles that submit more
+        // command data per frame (inFAMOUS Second Son overflows 2 MB).
+        const size_t GfxReservedSize = VideoCore::ReadbackTrace::CopyReserveBytes() >> 2;
         gfx_queue.ccb_buffer.reserve(GfxReservedSize);
         gfx_queue.dcb_buffer.reserve(GfxReservedSize);
     }

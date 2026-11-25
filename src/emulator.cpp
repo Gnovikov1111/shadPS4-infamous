@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -479,6 +480,33 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Loader, "Branch {}", Common::g_scm_branch);
     LOG_INFO(Loader, "Description {}", Common::g_scm_desc);
     LOG_INFO(Loader, "Remote {}", Common::g_scm_remote_url);
+
+    // Local experiment overrides (see video_core/readback_trace.h). They are stored as
+    // game-specific values for this run only and are never written to the global config.
+    if (const char* rb = std::getenv("SHADPS4_READBACKS"); rb && *rb) {
+        EmulatorSettings.SetReadbacksMode(static_cast<u32>(std::strtoul(rb, nullptr, 10)), true);
+        LOG_INFO(Config, "Experiment override: readbacks mode {} (SHADPS4_READBACKS)", rb);
+    }
+    if (const char* cb = std::getenv("SHADPS4_COPY_GPU_BUFFERS"); cb && *cb) {
+        EmulatorSettings.SetCopyGpuBuffers(*cb != '0', true);
+        LOG_INFO(Config, "Experiment override: copy GPU buffers {} (SHADPS4_COPY_GPU_BUFFERS)", cb);
+    }
+    if (const char* li = std::getenv("SHADPS4_READBACK_LINEAR"); li && *li) {
+        EmulatorSettings.SetReadbackLinearImagesEnabled(*li != '0', true);
+        LOG_INFO(Config, "Experiment override: linear image readbacks {} (SHADPS4_READBACK_LINEAR)",
+                 li);
+    }
+    {
+        const auto env_or_dash = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v ? v : "-";
+        };
+        LOG_INFO(Config,
+                 "Experiment env: EOP_FINISH={} TRACE_READBACKS={} COPY_RESERVE_MB={} "
+                 "FAULT_WIDEN_PAGES={}",
+                 env_or_dash("SHADPS4_EOP_FINISH"), env_or_dash("SHADPS4_TRACE_READBACKS"),
+                 env_or_dash("SHADPS4_COPY_RESERVE_MB"), env_or_dash("SHADPS4_FAULT_WIDEN_PAGES"));
+    }
 
     LOG_INFO(Config, "Game-specific config used: {}",
              EmulatorState::GetInstance()->IsGameSpecifigConfigUsed());
