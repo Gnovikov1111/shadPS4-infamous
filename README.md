@@ -12,7 +12,7 @@ profiler-driven speed-ups and a 21:9 ultrawide patch.**
 
 <a href="infamous-second-son/README.md"><img src="https://img.shields.io/badge/game-CUSA00004%20v01.07-b31b1b?style=for-the-badge" alt="Game: CUSA00004 v01.07"></a>
 <a href="infamous-second-son/README.md#ultrawide-219-patch"><img src="https://img.shields.io/badge/ultrawide-21%3A9-1f6feb?style=for-the-badge" alt="Ultrawide 21:9"></a>
-<a href="infamous-second-son/README.md#results"><img src="https://img.shields.io/badge/bridge%20view-6.5%20%E2%86%92%2021%20FPS-2ea043?style=for-the-badge" alt="Bridge view: 6.5 to 21 FPS"></a>
+<a href="https://github.com/weshayoub92/shadPS4-AYOUB1080p"><img src="https://img.shields.io/badge/fastest%20build-AYOUB1080p-8250df?style=for-the-badge" alt="Fastest build: AYOUB1080p"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0-8b949e?style=for-the-badge" alt="License: GPL-2.0"></a>
 
 [**Guide**](infamous-second-son/README.md) &nbsp;&middot;&nbsp;
@@ -26,8 +26,8 @@ profiler-driven speed-ups and a 21:9 ultrawide patch.**
 > [!TIP]
 > **Just want to play?** Use **[shadPS4-AYOUB1080p](https://github.com/weshayoub92/shadPS4-AYOUB1080p)
 > by AYOUB1080p**. His fork takes the same idea further by spreading the GPU work over several
-> threads, and it reached about **50 FPS in combat** on our test PC. Our ultrawide patch works
-> with it, and the guide has [a fix for its shader freezes](infamous-second-son/README.md#tips-for-the-ayoub1080p-build).
+> threads. On our test PC it usually runs at **30-60 FPS**, even in the heavy bridge view where
+> this branch manages about 21. Our ultrawide patch works with it, and the guide has [a fix for its shader freezes](infamous-second-son/README.md#tips-for-the-ayoub1080p-build).
 
 ### What's in this branch
 

@@ -33,11 +33,12 @@ Frame rates at 3440x1440 on an i9-12900KF + RTX 5070:
 
 | Scene | Before (switches off) | This branch | AYOUB1080p build |
 | --- | :---: | :---: | :---: |
-| Heavy outdoor bridge view | 6.5-7 | **~21** | - |
-| Long tunnel views | 8-12 | **~25** | - |
+| Heavy outdoor bridge view | 6.5-7 | ~21 | **usually 30-60** |
+| Long tunnel views | 8-12 | ~25 | - |
 | Combat | - | 26-32 | **up to ~50** |
 
-<sub>"-" means not measured.</sub>
+<sub>This branch was measured before we found the AYOUB1080p build; his numbers are from playing
+it since. "-" means not measured.</sub>
 
 ## Credits
 
